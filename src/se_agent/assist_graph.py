@@ -4,7 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-
+from langgraph.checkpoint.memory import MemorySaver
 from se_agent.config import Configuration
 from se_agent.state import (
     FileContent,
@@ -289,6 +289,7 @@ builder.add_edge("fetch_file_content", "suggest_solution")
 builder.add_edge("suggest_solution", "cleanup")
 builder.add_edge("cleanup", END)
 
-graph = builder.compile()
+memory = MemorySaver()
+graph = builder.compile(checkpointer=memory)
 
 graph.name = "AssistGraph"
