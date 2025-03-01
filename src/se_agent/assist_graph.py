@@ -1,10 +1,12 @@
 import sqlite3
+from typing import Union, Annotated, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from langgraph.checkpoint.memory import MemorySaver
+
 from se_agent.config import Configuration
 from se_agent.state import (
     FileContent,
@@ -13,6 +15,11 @@ from se_agent.state import (
     InputState,
     Package,
     PackageSuggestions,
+    Repo,
+    RepoEvent,
+    Event,
+    OnboardInputState,
+    OnboardState,
     State,
     file_suggestions_format_instuctions,
     package_suggestions_format_instuctions,
@@ -22,6 +29,105 @@ from se_agent.utils import (
     load_chat_model,
     shift_markdown_headings
 )
+from se_agent.onboard_graph import graph as onboard_graph
+
+def ensure_schema_exists() -> None:
+    """Create the DB tables if they do not exist, so we can safely query them."""
+    conn = sqlite3.connect("store.db")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS repositories (
+            repo_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            url                 TEXT NOT NULL,
+            src_path            TEXT NOT NULL,
+            branch              TEXT NOT NULL,
+            created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_modified_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(url, src_path, branch)
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS packages (
+            package_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_id             INTEGER NOT NULL,
+            package_name        TEXT NOT NULL,
+            summary             TEXT,
+            created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_modified_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (repo_id) REFERENCES repositories(repo_id),
+            UNIQUE(repo_id, package_name)
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            file_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_id             INTEGER NOT NULL,
+            package_id          INTEGER NOT NULL,
+            file_path           TEXT NOT NULL,
+            summary             TEXT,
+            created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_modified_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (repo_id) REFERENCES repositories(repo_id),
+            FOREIGN KEY (package_id) REFERENCES packages(package_id),
+            UNIQUE(repo_id, package_id, file_path)
+        );
+    """)
+
+    conn.close()
+
+
+def check_if_repo_onboarded(state: State, *, config: RunnableConfig) -> list[str]:
+    """
+    Conditional function that checks the DB if (url, src_folder, branch) is onboarded.
+    If found, return ["localize_packages"] (skip onboarding).
+    If not found, return ["onboard_repo"] (run OnboardGraph).
+    """
+    ensure_schema_exists()
+    conn = sqlite3.connect("store.db")
+    cursor = conn.execute(
+        """SELECT repo_id
+           FROM repositories
+           WHERE url = ? AND src_path = ? AND branch = ?""",
+        (state.repo.url, state.repo.src_folder, state.repo.branch)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if row is not None:
+        # Repo found => skip onboarding
+        return ["localize_packages"]
+    else:
+        # Not found => we must run OnboardGraph
+        return ["onboard_repo"]
+
+
+async def onboard_repo(state: State, *, config: RunnableConfig) -> dict:
+    """
+    If the repo is not found, this node calls the OnboardGraph subflow to clone and index it.
+    Returns the 'repo_id' assigned by the subflow.
+    """
+    configuration = Configuration.from_runnable_config(config)
+
+    # Build an OnboardInputState with event_type="repo-onboard"
+    onboard_input = OnboardInputState(
+        repo_event=RepoEvent(
+            repo=Repo(
+                url=state.repo.url,
+                src_folder=state.repo.src_folder,
+                branch=state.repo.branch
+            ),
+            event=Event(event_type="repo-onboard")
+        )
+    )
+
+    # Run the OnboardGraph. Final state is OnboardState.
+    onboard_result = await onboard_graph.ainvoke(onboard_input, config=config)
+
+    # The final OnboardState includes the newly created repo_id
+    return {
+        "repo_id": onboard_result["repo_id"]
+    }
 
 async def localize_packages(state: State, *, config: RunnableConfig) -> dict:
     """Localize package summaries by fetching existing packages from the database and prompting an LLM.
@@ -49,17 +155,25 @@ async def localize_packages(state: State, *, config: RunnableConfig) -> dict:
     # Connect to database
     conn = sqlite3.connect("store.db")
     
-    # --- 1) Fetch repository id ---
-    cursor = conn.execute(
-        """SELECT repo_id
-           FROM repositories
-           WHERE url = ? AND src_path = ? AND branch = ?""",
-        (state.repo.url,
-         state.repo.src_folder,
-         state.repo.branch)
-    )
-    row = cursor.fetchone()
-    repo_id = row[0]
+    # Use existing repo_id if available, otherwise fetch it
+    if state.repo_id:
+        repo_id = state.repo_id
+    else:
+        # --- 1) Fetch repository id ---
+        cursor = conn.execute(
+            """SELECT repo_id
+               FROM repositories
+               WHERE url = ? AND src_path = ? AND branch = ?""",
+            (state.repo.url,
+             state.repo.src_folder,
+             state.repo.branch)
+        )
+        row = cursor.fetchone()
+        repo_id = row[0] if row else None
+        
+        if not repo_id:
+            conn.close()
+            return {"error": "Repository not found in database"}
 
     # --- 2) Fetch package ids, names, and summaries for all packages with repo_id ---
     cursor = conn.execute(
@@ -276,13 +390,17 @@ async def cleanup(state: State, *, config: RunnableConfig) -> dict:
 # Initialize the state with default values
 builder = StateGraph(state_schema=State, input=InputState, config_schema=Configuration)
 
-builder.add_node(localize_packages)
-builder.add_node(localize_files)
-builder.add_node(fetch_file_content)
-builder.add_node(suggest_solution)
-builder.add_node(cleanup)
+# Add all nodes
+builder.add_node("onboard_repo", onboard_repo)
+builder.add_node("localize_packages", localize_packages)
+builder.add_node("localize_files", localize_files)
+builder.add_node("fetch_file_content", fetch_file_content)
+builder.add_node("suggest_solution", suggest_solution)
+builder.add_node("cleanup", cleanup)
 
-builder.add_edge(START, "localize_packages")
+# Create edges based on repository status
+builder.add_conditional_edges(START, check_if_repo_onboarded, ["onboard_repo", "localize_packages"])
+builder.add_edge("onboard_repo", "localize_packages")
 builder.add_edge("localize_packages", "localize_files")
 builder.add_conditional_edges("localize_files", continue_to_suggest_solution, ["fetch_file_content"])
 builder.add_edge("fetch_file_content", "suggest_solution")
